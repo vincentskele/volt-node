@@ -2,7 +2,12 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const SQLite = require('sqlite3').verbose();
-const { createLedgerService, stableStringify } = require('./ledgerService');
+const {
+  createLedgerService,
+  stableStringify,
+  PRIMARY_BALANCE_ACCOUNT,
+  normalizeLedgerAccount,
+} = require('./ledgerService');
 const { createEventLedgerService } = require('./eventLedgerService');
 
 function normalizeText(value) {
@@ -947,6 +952,7 @@ function applySystemEvent(state, event) {
       for (const row of snapshot.economy || []) {
         const userId = normalizeText(row.userID);
         if (!userId) continue;
+        const mergedBalance = normalizeInt(row.wallet, 0) + normalizeInt(row.bank, 0);
         upsertMapRow(state.economy, userId, {
           userID: userId,
           username: normalizeText(row.username),
@@ -956,8 +962,8 @@ function applySystemEvent(state, event) {
           profile_location: normalizeText(row.profile_location),
           profile_twitter_handle: normalizeText(row.profile_twitter_handle),
           last_dao_call_reward_at: normalizeInt(row.last_dao_call_reward_at, 0),
-          wallet: normalizeInt(row.wallet, 0),
-          bank: normalizeInt(row.bank, 0),
+          wallet: mergedBalance,
+          bank: 0,
         });
       }
 
@@ -1379,6 +1385,11 @@ function applySystemEvent(state, event) {
 function applyLedgerBalances(state, ledgerRows) {
   const balances = new Map();
 
+  for (const row of state.economy.values()) {
+    row.wallet = normalizeInt(row.wallet, 0) + normalizeInt(row.bank, 0);
+    row.bank = 0;
+  }
+
   for (const row of ledgerRows) {
     const metadata = typeof row.metadata === 'string'
       ? (() => {
@@ -1390,8 +1401,14 @@ function applyLedgerBalances(state, ledgerRows) {
       })()
       : (row.metadata || {});
 
-    const fromAccount = normalizeText(metadata.fromAccount) || (row.from_user_id ? 'wallet' : 'system');
-    const toAccount = normalizeText(metadata.toAccount) || (row.to_user_id ? 'wallet' : 'system');
+    const fromAccount = normalizeLedgerAccount(
+      normalizeText(metadata.fromAccount),
+      { defaultUserAccount: row.from_user_id ? PRIMARY_BALANCE_ACCOUNT : 'system' }
+    );
+    const toAccount = normalizeLedgerAccount(
+      normalizeText(metadata.toAccount),
+      { defaultUserAccount: row.to_user_id ? PRIMARY_BALANCE_ACCOUNT : 'system' }
+    );
     const amount = normalizeInt(row.amount, 0);
 
     if (row.from_user_id) {
@@ -1408,10 +1425,9 @@ function applyLedgerBalances(state, ledgerRows) {
     const [userID, account] = accountKey.split(':');
     const row = ensureEconomyRow(state, userID);
     if (!row) continue;
-    if (account === 'bank') {
-      row.bank = amount;
-    } else if (account === 'wallet') {
+    if (account === PRIMARY_BALANCE_ACCOUNT) {
       row.wallet = amount;
+      row.bank = 0;
     }
   }
 }

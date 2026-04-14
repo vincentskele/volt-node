@@ -4,6 +4,8 @@ const path = require('path');
 
 const GENESIS_HASH = 'VOLT_LEDGER_GENESIS_V1';
 const LEDGER_EXPORT_VERSION = 1;
+const PRIMARY_BALANCE_ACCOUNT = 'balance';
+const MERGED_BALANCE_ALIASES = new Set([PRIMARY_BALANCE_ACCOUNT, 'wallet', 'bank']);
 
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
@@ -26,6 +28,28 @@ function normalizeUserId(userId) {
   return String(userId);
 }
 
+function normalizeLedgerAccount(account, options = {}) {
+  const fallback = options.defaultUserAccount || PRIMARY_BALANCE_ACCOUNT;
+  if (account === null || typeof account === 'undefined' || account === '') {
+    return fallback;
+  }
+
+  const normalized = String(account).trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+
+  if (normalized === 'system') {
+    return 'system';
+  }
+
+  if (MERGED_BALANCE_ALIASES.has(normalized)) {
+    return PRIMARY_BALANCE_ACCOUNT;
+  }
+
+  return normalized;
+}
+
 function parseMetadata(rawMetadata) {
   if (!rawMetadata) return {};
   if (typeof rawMetadata === 'object') return rawMetadata;
@@ -42,13 +66,14 @@ function normalizeMetadataForStorage(metadata, fromUserId, toUserId) {
     ? { ...metadata }
     : {};
 
-  if (!baseMetadata.fromAccount) {
-    baseMetadata.fromAccount = fromUserId ? 'wallet' : 'system';
-  }
-
-  if (!baseMetadata.toAccount) {
-    baseMetadata.toAccount = toUserId ? 'wallet' : 'system';
-  }
+  baseMetadata.fromAccount = normalizeLedgerAccount(
+    baseMetadata.fromAccount,
+    { defaultUserAccount: fromUserId ? PRIMARY_BALANCE_ACCOUNT : 'system' }
+  );
+  baseMetadata.toAccount = normalizeLedgerAccount(
+    baseMetadata.toAccount,
+    { defaultUserAccount: toUserId ? PRIMARY_BALANCE_ACCOUNT : 'system' }
+  );
 
   if (!baseMetadata.ledgerVersion) {
     baseMetadata.ledgerVersion = LEDGER_EXPORT_VERSION;
@@ -59,8 +84,14 @@ function normalizeMetadataForStorage(metadata, fromUserId, toUserId) {
 
 function getLedgerAccounts(metadata, fromUserId, toUserId) {
   return {
-    fromAccount: metadata.fromAccount || (fromUserId ? 'wallet' : 'system'),
-    toAccount: metadata.toAccount || (toUserId ? 'wallet' : 'system'),
+    fromAccount: normalizeLedgerAccount(
+      metadata.fromAccount,
+      { defaultUserAccount: fromUserId ? PRIMARY_BALANCE_ACCOUNT : 'system' }
+    ),
+    toAccount: normalizeLedgerAccount(
+      metadata.toAccount,
+      { defaultUserAccount: toUserId ? PRIMARY_BALANCE_ACCOUNT : 'system' }
+    ),
   };
 }
 
@@ -191,6 +222,7 @@ function createLedgerService({ db, ensureUserEconomyRow = async () => {} }) {
   function ensureUserState(state, userId) {
     if (!state.users.has(userId)) {
       state.users.set(userId, {
+        balance: 0,
         wallet: 0,
         bank: 0,
         total: 0,
@@ -203,8 +235,9 @@ function createLedgerService({ db, ensureUserEconomyRow = async () => {} }) {
 
   function recomputeUserTotal(userState) {
     userState.total = Object.values(userState.accounts).reduce((sum, value) => sum + value, 0);
-    userState.wallet = userState.accounts.wallet || 0;
-    userState.bank = userState.accounts.bank || 0;
+    userState.balance = userState.accounts[PRIMARY_BALANCE_ACCOUNT] || 0;
+    userState.wallet = userState.balance;
+    userState.bank = 0;
   }
 
   function applyTransactionToState(state, row) {
@@ -257,8 +290,9 @@ function createLedgerService({ db, ensureUserEconomyRow = async () => {} }) {
     return cache;
   }
 
-  async function getUserAccountBalance(userId, account = 'wallet', { executor = defaultExecutor } = {}) {
+  async function getUserAccountBalance(userId, account = PRIMARY_BALANCE_ACCOUNT, { executor = defaultExecutor } = {}) {
     await initialize();
+    const normalizedAccount = normalizeLedgerAccount(account);
     const row = await executor.get(
       `SELECT COALESCE(SUM(CASE
          WHEN to_user_id = ? AND json_extract(metadata, '$.toAccount') = ? THEN amount
@@ -266,7 +300,7 @@ function createLedgerService({ db, ensureUserEconomyRow = async () => {} }) {
          ELSE 0
        END), 0) AS balance
        FROM transactions`,
-      [userId, account, userId, account]
+      [userId, normalizedAccount, userId, normalizedAccount]
     );
     return Number(row?.balance || 0);
   }
@@ -298,7 +332,10 @@ function createLedgerService({ db, ensureUserEconomyRow = async () => {} }) {
 
     try {
       if (fromUserId && entry.enforceSufficientFunds) {
-        const fromAccount = parsedMetadata.fromAccount || 'wallet';
+        const fromAccount = normalizeLedgerAccount(
+          parsedMetadata.fromAccount,
+          { defaultUserAccount: PRIMARY_BALANCE_ACCOUNT }
+        );
         const balance = await getUserAccountBalance(fromUserId, fromAccount, { executor });
         if (balance < amount) {
           throw new Error('Insufficient funds.');
@@ -371,6 +408,7 @@ function createLedgerService({ db, ensureUserEconomyRow = async () => {} }) {
     const state = await refreshCache();
     const user = state.users.get(String(userId));
     return {
+      balance: Number(user?.balance || 0),
       wallet: Number(user?.wallet || 0),
       bank: Number(user?.bank || 0),
       total: Number(user?.total || 0),
@@ -380,7 +418,7 @@ function createLedgerService({ db, ensureUserEconomyRow = async () => {} }) {
   async function getLeaderboard(limit = 10) {
     const state = await refreshCache();
     return [...state.users.entries()]
-      .map(([userId, info]) => ({ userId, total: info.total, wallet: info.wallet, bank: info.bank }))
+      .map(([userId, info]) => ({ userId, balance: info.balance, total: info.total, wallet: info.wallet, bank: info.bank }))
       .sort((left, right) => right.total - left.total || left.userId.localeCompare(right.userId))
       .slice(0, Math.max(1, Number(limit) || 10));
   }
@@ -476,6 +514,7 @@ function createLedgerService({ db, ensureUserEconomyRow = async () => {} }) {
 
     for (const [userID, balance] of [...state.users.entries()].sort(([left], [right]) => left.localeCompare(right))) {
       users[userID] = {
+        balance: balance.balance,
         wallet: balance.wallet,
         bank: balance.bank,
         total: balance.total,
@@ -650,6 +689,8 @@ function createLedgerService({ db, ensureUserEconomyRow = async () => {} }) {
 module.exports = {
   GENESIS_HASH,
   LEDGER_EXPORT_VERSION,
+  PRIMARY_BALANCE_ACCOUNT,
+  normalizeLedgerAccount,
   stableStringify,
   createLedgerService,
 };

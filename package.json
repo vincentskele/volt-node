@@ -1,0 +1,32 @@
+{
+  "name": "volt-node",
+  "version": "0.2.0",
+  "private": false,
+  "type": "commonjs",
+  "description": "Standalone Volt verifier node and peer witness layer",
+  "main": "src/cli.js",
+  "bin": {
+    "volt-node": "src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js start",
+    "init": "node src/cli.js init",
+    "sync": "node src/cli.js sync",
+    "verify": "node src/cli.js verify",
+    "status": "node src/cli.js status",
+    "check": "node --check src/cli.js && node --check src/ledgerService.js && node --check src/eventLedgerService.js && node --check src/stateRecovery.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "volt",
+    "volt-node",
+    "verifier",
+    "ledger",
+    "consensus"
+  ],
+  "dependencies": {
+    "sqlite3": "^5.1.7"
+  }
+}

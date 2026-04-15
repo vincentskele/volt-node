@@ -1293,9 +1293,9 @@ function applySystemEvent(state, event) {
         raffle_id: normalizeInt(metadata.raffleId, 0),
         user_id: normalizeText(metadata.userID),
         purchased_count: normalizeInt(metadata.newCount, 0),
-        bonus_10_given: (metadata.milestones || []).some((entry) => normalizeInt(entry.threshold, 0) === 10) ? 1 : 0,
-        bonus_25_given: (metadata.milestones || []).some((entry) => normalizeInt(entry.threshold, 0) === 25) ? 1 : 0,
-        bonus_50_given: (metadata.milestones || []).some((entry) => normalizeInt(entry.threshold, 0) === 50) ? 1 : 0,
+        bonus_10_given: normalizeInt(metadata.newCount, 0) >= 10 ? 1 : 0,
+        bonus_25_given: normalizeInt(metadata.newCount, 0) >= 25 ? 1 : 0,
+        bonus_50_given: normalizeInt(metadata.newCount, 0) >= 50 ? 1 : 0,
       });
       break;
     case 'raffles.remove_ticket_item':

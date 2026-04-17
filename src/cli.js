@@ -44,8 +44,11 @@ const DEFAULT_NODE_DIR = path.join(process.cwd(), '.volt-node');
 const LEGACY_SYNC_INTERVAL_MS = 30000;
 const DEFAULT_SYNC_INTERVAL_MS = 2000;
 const MIN_SYNC_INTERVAL_MS = 1000;
-const DEFAULT_REQUEST_TIMEOUT_MS = 1500;
-const DEFAULT_EXPORT_TIMEOUT_MS = 4000;
+const LEGACY_REQUEST_TIMEOUT_MS = 1500;
+const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
+const LEGACY_EXPORT_TIMEOUT_MS = 4000;
+const DEFAULT_EXPORT_TIMEOUT_MS = 8000;
+const NODE_SHARED_SECRET_HEADER = 'x-volt-node-shared-secret';
 
 function resolveNodeDir(inputDir) {
   return path.resolve(inputDir || DEFAULT_NODE_DIR);
@@ -602,6 +605,24 @@ function loadNodeConfig(paths) {
           ? DEFAULT_SYNC_INTERVAL_MS
           : savedSyncIntervalMs
       );
+  const savedRequestTimeoutMs = normalizePositiveInteger(saved.requestTimeoutMs, null);
+  const hasExplicitRequestTimeoutMs = typeof process.env.VOLT_NODE_REQUEST_TIMEOUT_MS !== 'undefined';
+  const requestTimeoutSeed = hasExplicitRequestTimeoutMs
+    ? process.env.VOLT_NODE_REQUEST_TIMEOUT_MS
+    : (
+        savedRequestTimeoutMs === null || savedRequestTimeoutMs === LEGACY_REQUEST_TIMEOUT_MS
+          ? DEFAULT_REQUEST_TIMEOUT_MS
+          : savedRequestTimeoutMs
+      );
+  const savedExportTimeoutMs = normalizePositiveInteger(saved.exportTimeoutMs, null);
+  const hasExplicitExportTimeoutMs = typeof process.env.VOLT_NODE_EXPORT_TIMEOUT_MS !== 'undefined';
+  const exportTimeoutSeed = hasExplicitExportTimeoutMs
+    ? process.env.VOLT_NODE_EXPORT_TIMEOUT_MS
+    : (
+        savedExportTimeoutMs === null || savedExportTimeoutMs === LEGACY_EXPORT_TIMEOUT_MS
+          ? DEFAULT_EXPORT_TIMEOUT_MS
+          : savedExportTimeoutMs
+      );
 
   return {
     ...saved,
@@ -629,14 +650,8 @@ function loadNodeConfig(paths) {
     ledgerSource: explicitLedgerSource,
     eventsSource: explicitEventsSource,
     syncIntervalMs: normalizeSyncIntervalMs(syncIntervalSeed, DEFAULT_SYNC_INTERVAL_MS),
-    requestTimeoutMs: normalizePositiveInteger(
-      process.env.VOLT_NODE_REQUEST_TIMEOUT_MS || saved.requestTimeoutMs,
-      DEFAULT_REQUEST_TIMEOUT_MS
-    ),
-    exportTimeoutMs: normalizePositiveInteger(
-      process.env.VOLT_NODE_EXPORT_TIMEOUT_MS || saved.exportTimeoutMs,
-      DEFAULT_EXPORT_TIMEOUT_MS
-    ),
+    requestTimeoutMs: normalizePositiveInteger(requestTimeoutSeed, DEFAULT_REQUEST_TIMEOUT_MS),
+    exportTimeoutMs: normalizePositiveInteger(exportTimeoutSeed, DEFAULT_EXPORT_TIMEOUT_MS),
     notes: 'Standalone verifier node for Volt. Prefers peer-served history and falls back to the execution server when needed.',
   };
 }

@@ -41,6 +41,11 @@ const HISTORY_WINDOW_MS = 48 * 60 * 60 * 1000;
 const DEFAULT_STATUS_PORT = Number(process.env.VOLT_NODE_STATUS_PORT || 8788);
 const DEFAULT_STATUS_HOST = String(process.env.VOLT_NODE_STATUS_HOST || '127.0.0.1').trim();
 const DEFAULT_NODE_DIR = path.join(process.cwd(), '.volt-node');
+const LEGACY_SYNC_INTERVAL_MS = 30000;
+const DEFAULT_SYNC_INTERVAL_MS = 2000;
+const MIN_SYNC_INTERVAL_MS = 1000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 1500;
+const DEFAULT_EXPORT_TIMEOUT_MS = 4000;
 
 function resolveNodeDir(inputDir) {
   return path.resolve(inputDir || DEFAULT_NODE_DIR);
@@ -165,6 +170,18 @@ function createNodeId(input) {
 function normalizeBaseUrl(input) {
   const value = String(input || '').trim().replace(/\/+$/, '');
   return value || null;
+}
+
+function normalizePositiveInteger(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) {
+    return fallback;
+  }
+  return Math.floor(number);
+}
+
+function normalizeSyncIntervalMs(value, fallback = DEFAULT_SYNC_INTERVAL_MS) {
+  return Math.max(MIN_SYNC_INTERVAL_MS, normalizePositiveInteger(value, fallback));
 }
 
 function normalizePeerUrl(peer) {
@@ -298,6 +315,9 @@ function buildRuntimeConfigSummary(config) {
     peers: Array.isArray(config.peers) ? config.peers : [],
     ledgerSource: config.ledgerSource || null,
     eventsSource: config.eventsSource || null,
+    syncIntervalMs: normalizeSyncIntervalMs(config.syncIntervalMs, DEFAULT_SYNC_INTERVAL_MS),
+    requestTimeoutMs: normalizePositiveInteger(config.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
+    exportTimeoutMs: normalizePositiveInteger(config.exportTimeoutMs, DEFAULT_EXPORT_TIMEOUT_MS),
     hasAnyUpstream: Boolean(
       config.baseUrl ||
       (Array.isArray(config.peers) && config.peers.length) ||
@@ -327,9 +347,34 @@ function saveCheckpoint(paths, checkpoint) {
   writeJson(paths.checkpointsPath, { entries });
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, {
-    headers: { accept: 'application/json' },
+async function fetchWithTimeout(url, options = {}) {
+  const { timeoutMs: rawTimeoutMs, ...fetchOptions } = options;
+  const timeoutMs = normalizePositiveInteger(rawTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetchWithTimeout(url, {
+    ...options,
+    headers: {
+      accept: 'application/json',
+      ...(options.headers || {}),
+    },
   });
 
   if (!response.ok) {
@@ -448,10 +493,12 @@ function buildPeerDisagreement(localStatus, peerStatus, peerUrl) {
   return issues;
 }
 
-async function fetchPeerStatus(peerUrl) {
+async function fetchPeerStatus(peerUrl, config = {}) {
   const observedAt = new Date().toISOString();
   try {
-    const payload = await fetchJson(peerUrl);
+    const payload = await fetchJson(peerUrl, {
+      timeoutMs: normalizePositiveInteger(config.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
+    });
     return {
       peerUrl,
       observedAt,
@@ -483,7 +530,9 @@ async function fetchDiscoveredPeers(config) {
   }
 
   try {
-    const payload = await fetchJson(discoveryUrl);
+    const payload = await fetchJson(discoveryUrl, {
+      timeoutMs: normalizePositiveInteger(config.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
+    });
     const nodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
     const seedStatusUrls = Array.isArray(payload?.seedStatusUrls) ? payload.seedStatusUrls : [];
     const selfStatusUrl = config.publicUrl ? normalizePeerUrl(config.publicUrl) : null;
@@ -544,6 +593,16 @@ function loadNodeConfig(paths) {
     ? parsePeerList(process.env.VOLT_NODE_PEERS)
     : parsePeerList(saved.peers || []);
 
+  const savedSyncIntervalMs = normalizePositiveInteger(saved.syncIntervalMs, null);
+  const hasExplicitSyncInterval = typeof process.env.VOLT_NODE_SYNC_INTERVAL_MS !== 'undefined';
+  const syncIntervalSeed = hasExplicitSyncInterval
+    ? process.env.VOLT_NODE_SYNC_INTERVAL_MS
+    : (
+        savedSyncIntervalMs === null || savedSyncIntervalMs === LEGACY_SYNC_INTERVAL_MS
+          ? DEFAULT_SYNC_INTERVAL_MS
+          : savedSyncIntervalMs
+      );
+
   return {
     ...saved,
     createdAt: saved.createdAt || new Date().toISOString(),
@@ -569,7 +628,15 @@ function loadNodeConfig(paths) {
     peers,
     ledgerSource: explicitLedgerSource,
     eventsSource: explicitEventsSource,
-    syncIntervalMs: Number(process.env.VOLT_NODE_SYNC_INTERVAL_MS || saved.syncIntervalMs || 30000),
+    syncIntervalMs: normalizeSyncIntervalMs(syncIntervalSeed, DEFAULT_SYNC_INTERVAL_MS),
+    requestTimeoutMs: normalizePositiveInteger(
+      process.env.VOLT_NODE_REQUEST_TIMEOUT_MS || saved.requestTimeoutMs,
+      DEFAULT_REQUEST_TIMEOUT_MS
+    ),
+    exportTimeoutMs: normalizePositiveInteger(
+      process.env.VOLT_NODE_EXPORT_TIMEOUT_MS || saved.exportTimeoutMs,
+      DEFAULT_EXPORT_TIMEOUT_MS
+    ),
     notes: 'Standalone verifier node for Volt. Prefers peer-served history and falls back to the execution server when needed.',
   };
 }
@@ -599,6 +666,8 @@ function printHelp() {
     '  VOLT_NODE_PEERS',
     '  VOLT_NODE_PUBLIC_URL',
     '  VOLT_NODE_SYNC_INTERVAL_MS',
+    '  VOLT_NODE_REQUEST_TIMEOUT_MS',
+    '  VOLT_NODE_EXPORT_TIMEOUT_MS',
   ].join('\n'));
 }
 
@@ -607,6 +676,7 @@ function createDatabase(dbPath) {
     const db = new SQLite.Database(dbPath, (error) => {
       if (error) return reject(error);
       db.configure('busyTimeout', 5000);
+      db.run('PRAGMA journal_mode = WAL');
       resolve(db);
     });
   });
@@ -652,14 +722,16 @@ async function commandInit(dirArg) {
   }
 }
 
-async function resolveSourceToFile(source, fallbackFilePath) {
+async function resolveSourceToFile(source, fallbackFilePath, options = {}) {
   const value = String(source || '').trim();
   if (!value) {
     throw new Error(`Missing source for ${fallbackFilePath}`);
   }
 
   if (/^https?:\/\//i.test(value)) {
-    const response = await fetch(value);
+    const response = await fetchWithTimeout(value, {
+      timeoutMs: normalizePositiveInteger(options.timeoutMs, DEFAULT_EXPORT_TIMEOUT_MS),
+    });
     if (!response.ok) {
       throw new Error(`Failed fetching ${value}: ${response.status} ${response.statusText}`);
     }
@@ -684,7 +756,7 @@ async function fetchConsensusCandidates(config) {
     ...parsePeerList(config.peers),
   ].filter(Boolean)));
 
-  const results = await Promise.all(peers.map((peerUrl) => fetchPeerStatus(peerUrl)));
+  const results = await Promise.all(peers.map((peerUrl) => fetchPeerStatus(peerUrl, config)));
   const online = results.filter((entry) => entry.online && deriveHeadKey(entry.payload));
   const byHead = new Map();
 
@@ -755,9 +827,11 @@ function buildSyncTargets(config, consensusCandidates) {
   return targets;
 }
 
-async function importIntoTempDb(paths, ledgerSource, eventsSource) {
-  await resolveSourceToFile(ledgerSource, paths.ledgerExportPath);
-  await resolveSourceToFile(eventsSource, paths.eventsExportPath);
+async function importIntoTempDb(paths, ledgerSource, eventsSource, options = {}) {
+  await Promise.all([
+    resolveSourceToFile(ledgerSource, paths.ledgerExportPath, options),
+    resolveSourceToFile(eventsSource, paths.eventsExportPath, options),
+  ]);
 
   if (fs.existsSync(paths.tempDbPath)) {
     fs.rmSync(paths.tempDbPath, { force: true });
@@ -823,7 +897,9 @@ async function syncNode(dirArg, overrides = {}) {
 
   for (const target of syncTargets) {
     try {
-      imported = await importIntoTempDb(paths, target.ledgerSource, target.eventsSource);
+      imported = await importIntoTempDb(paths, target.ledgerSource, target.eventsSource, {
+        timeoutMs: normalizePositiveInteger(config.exportTimeoutMs, DEFAULT_EXPORT_TIMEOUT_MS),
+      });
       successfulTarget = target;
       break;
     } catch (error) {
@@ -1104,7 +1180,7 @@ async function refreshPeerNetwork(paths, config) {
     return peerNetwork;
   }
 
-  const peerResults = await Promise.all(peerUrls.map((peerUrl) => fetchPeerStatus(peerUrl)));
+  const peerResults = await Promise.all(peerUrls.map((peerUrl) => fetchPeerStatus(peerUrl, config)));
   const checkedAt = new Date().toISOString();
   const peers = peerResults.map((result) => {
     if (!result.online) {
@@ -1200,7 +1276,7 @@ async function pushConsensusReport(paths, config) {
   };
 
   try {
-    const response = await fetch(reportUrl, {
+    const response = await fetchWithTimeout(reportUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1208,6 +1284,7 @@ async function pushConsensusReport(paths, config) {
         ...(config.reportKey ? { 'x-volt-consensus-key': config.reportKey } : {}),
       },
       body: JSON.stringify(payload),
+      timeoutMs: normalizePositiveInteger(config.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -1273,13 +1350,14 @@ async function pushNodePresence(paths, config, mode = 'heartbeat') {
   };
 
   try {
-    const response = await fetch(targetUrl, {
+    const response = await fetchWithTimeout(targetUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...(config.nodeAuthKey ? { 'x-volt-node-key': config.nodeAuthKey } : {}),
       },
       body: JSON.stringify(payload),
+      timeoutMs: normalizePositiveInteger(config.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -1575,6 +1653,7 @@ function buildDashboardHtml(config) {
             '<div style="display:grid;gap:12px;">' +
               '<label><strong>Execution Server URL</strong><br /><input name="baseUrl" value="' + escapeHtml(runtimeConfig.baseUrl || '') + '" placeholder="https://volt.example.com" style="width:100%;margin-top:6px;padding:10px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e5e7eb;" /></label>' +
               '<label><strong>Other Volt Nodes (optional)</strong><br /><input name="peers" value="' + escapeHtml((runtimeConfig.peers || []).join(', ')) + '" placeholder="Only needed for manual overrides" style="width:100%;margin-top:6px;padding:10px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e5e7eb;" /></label>' +
+              '<label><strong>Sync Interval (ms)</strong><br /><input name="syncIntervalMs" type="number" min="1000" step="500" value="' + escapeHtml(runtimeConfig.syncIntervalMs || 2000) + '" placeholder="2000" style="width:100%;margin-top:6px;padding:10px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e5e7eb;" /></label>' +
               '<label><strong>Consensus Report URL</strong><br /><input name="reportUrl" value="' + escapeHtml(runtimeConfig.reportUrl || '') + '" placeholder="https://volt.example.com/api/consensus/report" style="width:100%;margin-top:6px;padding:10px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e5e7eb;" /></label>' +
               '<label><strong>Report Key</strong><br /><input name="reportKey" value="" placeholder="Optional shared secret" style="width:100%;margin-top:6px;padding:10px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e5e7eb;" /></label>' +
               '<button type="submit" style="padding:12px 14px;border:0;border-radius:999px;background:#38bdf8;color:#082f49;font-weight:800;cursor:pointer;">Save Node Config</button>' +
@@ -1590,6 +1669,7 @@ function buildDashboardHtml(config) {
           const payload = {
             baseUrl: String(formData.get('baseUrl') || '').trim(),
             peers: String(formData.get('peers') || '').trim(),
+            syncIntervalMs: String(formData.get('syncIntervalMs') || '').trim(),
             reportUrl: String(formData.get('reportUrl') || '').trim(),
             reportKey: String(formData.get('reportKey') || '').trim(),
           };
@@ -1620,7 +1700,7 @@ function buildDashboardHtml(config) {
     loadStatus().catch(console.error);
     setInterval(() => {
       loadStatus().catch(console.error);
-    }, 10000);
+    }, 2000);
   </script>
 </body>
 </html>`;
@@ -1688,6 +1768,10 @@ function startNodeStatusServer(paths, config) {
         const nextDiscoveryUrl = nextBaseUrl ? `${nextBaseUrl}/api/nodes` : null;
         const nextRegisterUrl = nextBaseUrl ? `${nextBaseUrl}/api/nodes/register` : null;
         const nextHeartbeatUrl = nextBaseUrl ? `${nextBaseUrl}/api/nodes/heartbeat` : null;
+        const nextSyncIntervalMs = normalizeSyncIntervalMs(
+          body.syncIntervalMs || config.syncIntervalMs || DEFAULT_SYNC_INTERVAL_MS,
+          DEFAULT_SYNC_INTERVAL_MS
+        );
         const nextConfig = {
           ...loadNodeConfig(paths),
           baseUrl: nextBaseUrl,
@@ -1695,6 +1779,7 @@ function startNodeStatusServer(paths, config) {
           discoveryUrl: nextDiscoveryUrl,
           registerUrl: nextRegisterUrl,
           heartbeatUrl: nextHeartbeatUrl,
+          syncIntervalMs: nextSyncIntervalMs,
           reportUrl: nextReportUrl,
           reportKey: String(body.reportKey || '').trim() || config.reportKey || null,
           peers: nextPeers,
@@ -1776,11 +1861,14 @@ async function commandStart(dirArg) {
   await commandInit(nodeDir);
 
   const config = await ensureNodeAuthKey(paths, loadNodeConfig(paths));
+  config.syncIntervalMs = normalizeSyncIntervalMs(config.syncIntervalMs, DEFAULT_SYNC_INTERVAL_MS);
   saveNodeConfig(paths, config);
-  const syncIntervalMs = Math.max(5000, Number(config.syncIntervalMs || 30000));
   const statusServer = startNodeStatusServer(paths, config);
+  let nextCycleTimer = null;
+  let shuttingDown = false;
 
   async function runSyncCycle() {
+    const cycleStartedAt = Date.now();
     try {
       setNodeStatus(paths, {
         ...buildSelfDescriptor(config, paths),
@@ -1852,6 +1940,13 @@ async function commandStart(dirArg) {
       });
       await pushConsensusReport(paths, config).catch(() => {});
       console.error(`[volt-node] sync failed • ${message}`);
+    } finally {
+      if (!shuttingDown) {
+        const elapsedMs = Date.now() - cycleStartedAt;
+        const intervalMs = normalizeSyncIntervalMs(config.syncIntervalMs, DEFAULT_SYNC_INTERVAL_MS);
+        const nextDelayMs = Math.max(0, intervalMs - elapsedMs);
+        nextCycleTimer = setTimeout(runSyncCycle, nextDelayMs);
+      }
     }
   }
 
@@ -1860,7 +1955,7 @@ async function commandStart(dirArg) {
   console.log(`[volt-node] configured event source: ${config.eventsSource}`);
   console.log(`[volt-node] primary status source: ${config.primaryStatusUrl || 'none'}`);
   console.log(`[volt-node] execution report url: ${config.reportUrl || 'disabled'}`);
-  console.log(`[volt-node] sync interval: ${syncIntervalMs}ms`);
+  console.log(`[volt-node] sync interval: ${config.syncIntervalMs}ms`);
 
   setNodeStatus(paths, {
     ...buildSelfDescriptor(config, paths),
@@ -1879,10 +1974,13 @@ async function commandStart(dirArg) {
   console.log(`[volt-node] discovery register • ${registerResult.status}`);
 
   await runSyncCycle();
-  const interval = setInterval(runSyncCycle, syncIntervalMs);
 
   async function shutdown(signal) {
-    clearInterval(interval);
+    shuttingDown = true;
+    if (nextCycleTimer) {
+      clearTimeout(nextCycleTimer);
+      nextCycleTimer = null;
+    }
     statusServer.close();
     const currentStatus = readJson(paths.statusPath, {}) || {};
     setNodeStatus(paths, {
